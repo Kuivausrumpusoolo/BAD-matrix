@@ -5,10 +5,8 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import datetime
 
-# TODO
-# gpu use
-
-device = torch.device('cpu')
+device = torch.device('cuda:0')
+#device = torch.device('cpu')
 
 mode_labels = [
     'BAD, no CF gradient',
@@ -26,7 +24,7 @@ payoff_values = np.asarray([
         [[10, 0, 0], [4, 8, 4], [10, 0, 0]],
     ],
 ], dtype=np.float32)
-payoff_tensor = torch.tensor(payoff_values)
+payoff_tensor = torch.tensor(payoff_values).to(device)
 
 num_cards = payoff_values.shape[0] # C
 num_actions = payoff_values.shape[-1] # A
@@ -56,7 +54,8 @@ class A0(nn.Module):
         # These are the 'counterfactual inputs', i.e., all possible cards.
         # repeated_in.shape = (batch_size * C,)
         repeated_in = torch.tensor([i % num_cards
-                                    for i in range(num_cards * batch_size)])
+                                    for i in range(num_cards * batch_size)],
+                                   device=payoff_tensor.device)
         one_hot = F.one_hot(repeated_in, num_cards).float() # (batch_size * C, C)
 
         # Next we calculate the counterfactual action and log_p for each batch and hand.
@@ -67,9 +66,9 @@ class A0(nn.Module):
 
         # Multinomial distribution with num of trials 1, event log probabilities log_p0
         m = torch.distributions.multinomial.Multinomial(1, logits=log_p0)
-        cf_action = m.sample() # one-hot matrix of shape (batch_size * C, A)
+        cf_action = m.sample().to(device) # one-hot matrix of shape (batch_size * C, A)
         # Log prob of choosing that action. log_cf.shape = (batch_size * C,)
-        log_cf = m.log_prob(cf_action)
+        log_cf = m.log_prob(cf_action).to(device)
 
         # Reverse one-hot encoding. cf_action.shape = (batch_size * C,)
         cf_action = torch.argmax(cf_action, dim=1)
@@ -87,10 +86,11 @@ class A0(nn.Module):
         repeated_actions = u0.repeat(num_cards, 1).transpose(1, 0)
 
         # A hand is possible iff the action in that hand matches the action chosen.
-        weights = (repeated_actions == cf_action).float() # (batch_size, C)
+        weights = (repeated_actions == cf_action).float().to(device) # (batch_size, C)
 
         # Normalize beliefs to sum to 1.
         beliefs = weights / weights.sum(dim=-1, keepdim=True) # (batch_size, C)
+        beliefs = beliefs.to(device)
 
         return u0, beliefs, log_cf
 
@@ -130,11 +130,11 @@ class A1(nn.Module):
 
         # Sample and get log-prob of action selected
         m = torch.distributions.multinomial.Multinomial(1, logits=log_p1)
-        u1 = m.sample()  # one_hot (batch_size, A)
-        log_p1 = m.log_prob(u1) # (batch_size,)
+        u1 = m.sample().to(device)  # one_hot (batch_size, A)
+        log_p1 = m.log_prob(u1).to(device) # (batch_size,)
 
         # Reverse the one-hot encoding
-        u1 = torch.argmax(u1, dim=1) # (batch_size,)
+        u1 = torch.argmax(u1, dim=1).to(device) # (batch_size,)
         return u1, log_p1
 
 
@@ -190,11 +190,11 @@ def train(bad_mode,
 
         # Reinitialize the model (probably a better way to do this..)
 
-        a0 = A0()
-        a1 = A1()
+        a0 = A0().to(device)
+        a1 = A1().to(device)
 
-        baseline_0_mlp = Baseline_0_mlp()
-        baseline_1_mlp = Baseline_1_mlp()
+        baseline_0_mlp = Baseline_0_mlp().to(device)
+        baseline_1_mlp = Baseline_1_mlp().to(device)
 
         policy_parameters = list(a0.parameters()) + list(a1.parameters())
         adam_policy = torch.optim.Adam(policy_parameters)
@@ -210,8 +210,8 @@ def train(bad_mode,
 
             cards_0 = np.random.choice(num_cards, size=batch_size)
             cards_1 = np.random.choice(num_cards, size=batch_size)
-            input_0 = torch.tensor(cards_0)
-            input_1 = torch.tensor(cards_1)
+            input_0 = torch.tensor(cards_0, device=payoff_tensor.device)
+            input_1 = torch.tensor(cards_1, device=payoff_tensor.device)
 
             u0, beliefs, log_cf = a0(cards_0) # TODO change to input_0
 
@@ -222,11 +222,11 @@ def train(bad_mode,
 
             if bad_mode == 2:
                 joint_in1 = torch.cat((F.one_hot(u0, num_actions).float(),
-                                       F.one_hot(input_1, num_cards).float()), 1)
+                                       F.one_hot(input_1, num_cards).float()), 1).to(device)
             else:
                 joint_in1 = torch.cat((F.one_hot(u0, num_actions).float(),
                                        beliefs,
-                                       F.one_hot(input_1, num_cards).float()), 1)
+                                       F.one_hot(input_1, num_cards).float()), 1).to(device)
             u1, log_p1 = a1(joint_in1)
 
             baseline_1_input = torch.cat((F.one_hot(input_0, num_cards).float(),
@@ -294,7 +294,7 @@ else:
 num_readings = 100
 batch_size=32
 
-skip_training = True
+skip_training = False
 if not skip_training:
     rewards_by_bad_mode = {}
     for bad_mode in range(3):
