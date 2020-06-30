@@ -5,8 +5,8 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import datetime
 
-device = torch.device('cuda:0')
-#device = torch.device('cpu')
+#device = torch.device('cuda:0')
+device = torch.device('cpu')
 
 mode_labels = [
     'BAD, no CF gradient',
@@ -26,11 +26,21 @@ payoff_values = np.asarray([
 ], dtype=np.float32)
 payoff_tensor = torch.tensor(payoff_values).to(device)
 
-num_cards = payoff_values.shape[0] # C
-num_actions = payoff_values.shape[-1] # A
+num_cards = payoff_values.shape[0]  # C
+num_actions = payoff_values.shape[-1]  # A
 
 # Number of hidden layers in A1.p1 and baselines
 num_hidden = 32
+
+batch_size = 32
+
+# These are the 'counterfactual inputs', i.e., all possible cards.
+# repeated_in.shape = (batch_size * C,)
+repeated_in = torch.tensor([i % num_cards
+    for i in range(num_cards * batch_size)],
+    device=device)
+
+one_hot = F.one_hot(repeated_in, num_cards).float()  # (batch_size * C, C)
 
 # Agent 0
 class A0(nn.Module):
@@ -38,7 +48,7 @@ class A0(nn.Module):
         super(A0, self).__init__()
         self.weights_0 = nn.Linear(num_cards, num_actions)
 
-    def forward(self, cards_0):
+    def forward(self, input_0):
         """
         Args:
           cards_0 of shape (batch_size,): Input is a single card 0,...,C dealt to player0
@@ -51,46 +61,41 @@ class A0(nn.Module):
           log_cf of shape (batch_size, C): Log prob of the action chosen for each possible card_0
         """
 
-        # These are the 'counterfactual inputs', i.e., all possible cards.
-        # repeated_in.shape = (batch_size * C,)
-        repeated_in = torch.tensor([i % num_cards
-                                    for i in range(num_cards * batch_size)],
-                                   device=payoff_tensor.device)
-        one_hot = F.one_hot(repeated_in, num_cards).float() # (batch_size * C, C)
-
-        # Next we calculate the counterfactual action and log_p for each batch and hand.
+        # We calculate the counterfactual action and log_p for each batch and hand.
 
         # Log prob of choosing action when given input c
         # log_p0.shape = (batch_size * C, A)
         log_p0 = F.log_softmax(self.weights_0(one_hot), dim=1)
 
+
         # Multinomial distribution with num of trials 1, event log probabilities log_p0
         m = torch.distributions.multinomial.Multinomial(1, logits=log_p0)
-        cf_action = m.sample().to(device) # one-hot matrix of shape (batch_size * C, A)
+        cf_action = m.sample()  # one-hot matrix of shape (batch_size * C, A)
+
         # Log prob of choosing that action. log_cf.shape = (batch_size * C,)
-        log_cf = m.log_prob(cf_action).to(device)
+        log_cf = m.log_prob(cf_action)
+        
 
         # Reverse one-hot encoding. cf_action.shape = (batch_size * C,)
         cf_action = torch.argmax(cf_action, dim=1)
         # Some reshaping
-        cf_action = cf_action.reshape([batch_size, -1]) # (batch_size, C)
-        log_cf = log_cf.reshape([batch_size, -1]) # (batch_size, C)
+        cf_action = cf_action.reshape([batch_size, -1])  # (batch_size, C)
+        log_cf = log_cf.reshape([batch_size, -1])  # (batch_size, C)
 
         # Now we need to know the action the agent actually took.
         # This is done by indexing the cf_action with the private observation.
         # u0.shape = (batch_size,)
-        u0 = cf_action[range(batch_size), cards_0]
+        u0 = cf_action[range(batch_size), input_0]
 
         # Repeating the action chosen so that we can check all matches
         # repeated_actions.shape = (batch_size, C)
         repeated_actions = u0.repeat(num_cards, 1).transpose(1, 0)
 
         # A hand is possible iff the action in that hand matches the action chosen.
-        weights = (repeated_actions == cf_action).float().to(device) # (batch_size, C)
+        weights = (repeated_actions == cf_action).float()  # (batch_size, C)
 
         # Normalize beliefs to sum to 1.
-        beliefs = weights / weights.sum(dim=-1, keepdim=True) # (batch_size, C)
-        beliefs = beliefs.to(device)
+        beliefs = weights / weights.sum(dim=-1, keepdim=True)  # (batch_size, C)
 
         return u0, beliefs, log_cf
 
@@ -127,14 +132,13 @@ class A1(nn.Module):
         # Evaluate policy for agent 1
         # Log probs of actions. log_p1.shape = (batch_size, A)
         log_p1 = F.log_softmax(self.p1(joint_in1), 1)
-
         # Sample and get log-prob of action selected
         m = torch.distributions.multinomial.Multinomial(1, logits=log_p1)
-        u1 = m.sample().to(device)  # one_hot (batch_size, A)
-        log_p1 = m.log_prob(u1).to(device) # (batch_size,)
+        u1 = m.sample()  # one_hot (batch_size, A)
+        log_p1 = m.log_prob(u1)  # (batch_size,)
 
         # Reverse the one-hot encoding
-        u1 = torch.argmax(u1, dim=1).to(device) # (batch_size,)
+        u1 = torch.argmax(u1, dim=1)  # (batch_size,)
         return u1, log_p1
 
 
@@ -184,11 +188,9 @@ def train(bad_mode,
     interval = num_episodes // num_readings
 
     for run_id in range(num_runs):
-        if run_id % max(num_runs // 10, 1) == 0:
-            print('Run {}/{} ...'.format(run_id + 1, num_runs))
-
-
-        # Reinitialize the model (probably a better way to do this..)
+        #if run_id % max(num_runs // 10, 1) == 0:
+        #    print('Run {}/{} ...'.format(run_id + 1, num_runs))
+        print('Run {}/{} ...'.format(run_id + 1, num_runs))
 
         a0 = A0().to(device)
         a1 = A1().to(device)
@@ -202,31 +204,29 @@ def train(bad_mode,
         baseline_parameters = list(baseline_0_mlp.parameters()) + list(baseline_1_mlp.parameters())
         adam_baseline = torch.optim.Adam(baseline_parameters)
 
-
-
         for episode_id in range(num_episodes + 1):
             adam_baseline.zero_grad()
             adam_policy.zero_grad()
 
             cards_0 = np.random.choice(num_cards, size=batch_size)
             cards_1 = np.random.choice(num_cards, size=batch_size)
-            input_0 = torch.tensor(cards_0, device=payoff_tensor.device)
-            input_1 = torch.tensor(cards_1, device=payoff_tensor.device)
+            input_0 = torch.tensor(cards_0, device=device)
+            input_1 = torch.tensor(cards_1, device=device)
 
-            u0, beliefs, log_cf = a0(cards_0) # TODO change to input_0
+            u0, beliefs, log_cf = a0(input_0) 
 
             # baseline_0_input.shape = (batch_size, 2 * C)
             baseline_0_input = torch.cat((F.one_hot(input_0, num_cards).float(),
                                           F.one_hot(input_1, num_cards).float()), 1)
-            baseline_0 = baseline_0_mlp(baseline_0_input) # (batch_size,)
+            baseline_0 = baseline_0_mlp(baseline_0_input)  # (batch_size,)
 
             if bad_mode == 2:
                 joint_in1 = torch.cat((F.one_hot(u0, num_actions).float(),
-                                       F.one_hot(input_1, num_cards).float()), 1).to(device)
+                                       F.one_hot(input_1, num_cards).float()), 1)
             else:
                 joint_in1 = torch.cat((F.one_hot(u0, num_actions).float(),
                                        beliefs,
-                                       F.one_hot(input_1, num_cards).float()), 1).to(device)
+                                       F.one_hot(input_1, num_cards).float()), 1)
             u1, log_p1 = a1(joint_in1)
 
             baseline_1_input = torch.cat((F.one_hot(input_0, num_cards).float(),
@@ -234,14 +234,14 @@ def train(bad_mode,
             baseline_1 = baseline_1_mlp(baseline_1_input)
 
             batch_reward = torch.stack([payoff_tensor[input_0[i], input_1[i], u0[i], u1[i]]
-                                   for i in range(batch_size)]) # (batch_size,)
+                                   for i in range(batch_size)])  # (batch_size,)
 
             mean_batch_reward = torch.mean(batch_reward).item()
 
             # log_cf contains log probabilities for counterfactual actions
-            # we index those probabilities with cards_0 to find the log prob for the action
+            # we index those probabilities with input_0 to find the log prob for the action
             # that agent 0 actually took
-            log_p0 = log_cf[range(batch_size), cards_0]
+            log_p0 = log_cf[range(batch_size), input_0]
             # Joint-action includes all the counterfactual probs - it's simply the sum.
             joint_log_p0 = log_cf.sum(dim=-1)
 
@@ -255,7 +255,7 @@ def train(bad_mode,
             # Policy-gradient loss
             pg_final = torch.mean((batch_reward - baseline_0.detach()) * log_p0_train)
             pg_final += torch.mean((batch_reward - baseline_1.detach()) * log_p1_train)
-            pg_final = -pg_final # minimize negative
+            pg_final = -pg_final  # minimize negative
 
             # Baseline loss
             total_baseline_loss = torch.mean(torch.square(batch_reward - baseline_0))
@@ -267,8 +267,6 @@ def train(bad_mode,
             total_baseline_loss.backward()
             adam_baseline.step()
 
-            #total_policy_loss += pg_final.item()
-
             # Maybe save.
             if episode_id % interval == 0:
                 rewards[run_id, episode_id // interval] = mean_batch_reward
@@ -277,20 +275,16 @@ def train(bad_mode,
             if debug and episode_id % (num_episodes // 5) == 0:
                 print(episode_id, 'reward:', mean_batch_reward)
 
-            # if episode_id % 200 == 1:
-            #     print('Run {}, episode {}, reward {}'.format(run_id, episode_id, reward))
-            #     total_policy_loss = 0
-
     return rewards
 
 
 debug = True
 if debug:
-    num_runs = 3
-    num_episodes = 1000
+    num_runs = 1
+    num_episodes = 10000
 else:
-    num_runs = 10
-    num_episodes = 15000
+    num_runs = 30
+    num_episodes = 20000
 num_readings = 100
 batch_size=32
 
@@ -299,6 +293,7 @@ if not skip_training:
     rewards_by_bad_mode = {}
     for bad_mode in range(3):
         print('Running', mode_labels[bad_mode])
+        print("Current time: " + datetime.datetime.now().strftime("%M:%S"))
         rewards_by_bad_mode[bad_mode] = train(bad_mode,
                                               num_runs=num_runs,
                                               num_episodes=num_episodes,
@@ -319,8 +314,6 @@ if skip_training:
     num_readings = rewards_by_bad_mode[0].shape[1] - 1
     # can't access num_episodes!
     num_episodes = 15000
-
-
 
 
 plt.figure(figsize=(10, 5))
